@@ -25,12 +25,11 @@ prestashop = PrestaShopWebServiceDict('http://3.91.148.17/api', credentials["Pre
 prestashop.debug = True
 
 def check_product(p_id):
-    # try:
-    product = prestashop.get(f"products/{p_id}")  # /?display=[name,manufacturer_name,id_supplier,type,price,description]")
-    print(product)
-    return product
-    # except:
-    #     return None
+    try:
+        product = prestashop.get(f"products/{p_id}")  # /?display=[name,manufacturer_name,id_supplier,type,price,description]")
+        return product
+    except:
+        return None
 
 @cache.memoize(timeout=900)
 def get_description(product):
