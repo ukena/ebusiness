@@ -1,9 +1,12 @@
-from flask import Flask, render_template, request, flash, abort
+from flask import Flask, render_template, request, flash, abort, redirect, url_for
 from flask_caching import Cache
 import openai
 from prestapyt import PrestaShopWebServiceDict
+from PIL import Image
 import deepl
 import os
+import io
+import urllib.request
 
 config = {
     "DEBUG": True,          # some Flask specific configs
@@ -24,6 +27,12 @@ credentials = {
 prestashop = PrestaShopWebServiceDict('http://3.91.148.17/api', credentials["PrestaShop"])
 prestashop.debug = True
 
+openai.api_key = credentials["OpenAI"]
+
+def translate(text, target_lang="DE"):
+    translator = deepl.Translator(auth_key=credentials["DeepL"])
+    return translator.translate_text(text, target_lang=target_lang)
+
 def check_product(p_id):
     try:
         product = prestashop.get(f"products/{p_id}")  # /?display=[name,manufacturer_name,id_supplier,type,price,description]")
@@ -32,12 +41,25 @@ def check_product(p_id):
         return None
 
 @cache.memoize(timeout=900)
+def generate_images(prompt):
+    prompt_en = translate(prompt, target_lang="EN-US")
+    response = openai.Image.create(
+        prompt=str(prompt_en),
+        n=8,
+        size="1024x1024",
+        response_format="url"
+    )
+    return [r["url"] for r in response["data"]]
+
+@cache.memoize(timeout=900)
 def get_description(product):
     def get_attributes():
         features_out = ""
 
         features = product.get('product', {}).get('associations', {}).get('product_features', {}).get('product_feature')
-
+        features = [features] if isinstance(features, dict) else features
+        # {'id': '1', 'id_feature_value': '3'}
+        # [{'id': '3', 'id_feature_value': '12'}, {'id': '5', 'id_feature_value': '21'}, {'id': '7', 'id_feature_value': '28'}]
         ex_feature = []
         for key in features:
             # Extrahieren vom Namen des Produktfeatures
@@ -78,9 +100,6 @@ def get_description(product):
             return f"manufacturer: {manufacturer_name}, price: {price}, name: {name}"
 
     def generate_description(attr, features_out=""):
-        # open ai anfragen, um eine description zu erzeugen
-        openai.api_key = credentials["OpenAI"]
-
         # product_attributes = "type:Radio\ncolor:red\nwatt:2000W\nprice:1200$\n"
         prompt = f"""Write a product description of at least 100 words based on the following attributes: \n {attr} and Features: \n {features_out}
         Also state the facts to inform the customer, but don't overdo it and do not exaggerate with the product description. """
@@ -100,10 +119,6 @@ def get_description(product):
         response_text = response["choices"][0]["text"]
         return response_text
 
-    def translate(text):
-        translator = deepl.Translator(auth_key=credentials["DeepL"])
-        return translator.translate_text(text, target_lang="DE")
-
     attributes = get_attributes()
     desc_en = generate_description(attributes)
     desc_de = translate(desc_en)
@@ -111,25 +126,55 @@ def get_description(product):
 
 
 @app.route("/", methods=["GET", "POST"])
-def index():
+def beschreibung():
     if request.method == "POST":
         final_desc = request.form.get("beschreibung")
         if final_desc:
             # flash("Produkt aktualisiert", "success")
-            return render_template("index.html")
+            return render_template("beschreibung.html")
 
         p_id = request.form.get("produkt")
         product = check_product(p_id)
 
         if not product:
             flash(f"Es konnte kein Produkt mit der ID {p_id} gefunden werden.", "danger")
-            return render_template("index.html")
+            return render_template("beschreibung.html")
 
         try:
             desc = get_description(product)
         except openai.error.ServiceUnavailableError:
             abort(500)
         flash("Die folgende Beschreibung wurde automatisch generiert. Du kannst hier noch änderungen vornehmen, und sie dann in den Shop kopieren..", "success")
-        return render_template("index.html", desc=desc)
+        return render_template("beschreibung.html", desc=desc)
 
-    return render_template("index.html")
+    return render_template("beschreibung.html")
+
+@app.route("/bilder", methods=["GET", "POST"])
+def bilder():
+    if request.method == "POST":
+        url = request.form.get("img")
+        if url:
+            img_filename = "temp_img.png"
+            urllib.request.urlretrieve(url, img_filename)
+
+            img = Image.open(img_filename)
+            img.convert("RGB").save("temp_img.jpg")
+
+            with io.open("temp_img.jpg", "rb") as f:
+                content = f.read()
+
+            prestashop.add(f"/images/products/{request.form.get('produkt')}", files=[("image", "temp_img.jpg", content)])
+            flash(f"Das Bild wurde erfolgreich zum Produkt hinzugefügt!", "success")
+            return redirect(url_for("bilder"))
+
+        p_id = request.form.get("produkt")
+        product = check_product(p_id)
+        if not product:
+            flash(f"Es konnte kein Produkt mit der ID {p_id} gefunden werden.", "danger")
+            return render_template("bilder.html")
+
+        prompt = request.form.get("prompt")
+        urls = generate_images(prompt)
+        flash(f"Die folgenden Bilder wurden automatisch generiert. Wähle das aus, was für das Produkt mit der ID {p_id} hochgeladen werden soll.", "success")
+        return render_template("bilder.html", urls=urls, p_id=p_id)
+    return render_template("bilder.html")
